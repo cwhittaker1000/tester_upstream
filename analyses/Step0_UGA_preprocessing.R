@@ -61,7 +61,7 @@ n_spillover_samples <- 500
 # Half-width of the 2D swath (km). The swath extends this far on either
 # side of the spillover-to-hub axis. 50km captures lateral diffusion
 # and alternative corridors without requiring a full national grid.
-swath_half_width_km <- 50
+swath_half_width_km <- 20
 
 # Radius (km) around a hub centre within which cells are classified as 
 # "hub cells" in a swath. When cumulative infections in these cells
@@ -122,15 +122,15 @@ cat("  Valid cells: ", sum(!is.na(values(r_cattle))), "/", ncell(r_cattle), "\n\
 cat("Loading travel time to cities...\n")
 r_travel <- rast(travel_file)
 
-cat("  Dimensions:  ", nrow(r_travel), "x", ncol(r_travel), "\n")
-cat("  Resolution:  ", res(r_travel), "degrees\n")
-cat("  Resolution:  ~", round(res(r_travel)[1] * 111, 2), "km\n")
-cat("  Extent:      ", as.vector(ext(r_travel)), "\n")
-
-travel_vals <- values(r_travel, na.rm = TRUE)
-cat("  Value range: ", range(travel_vals), " minutes\n")
-cat("  Mean:        ", mean(travel_vals), " minutes\n")
-cat("  Valid cells: ", sum(!is.na(values(r_travel))), "/", ncell(r_travel), "\n\n")
+# cat("  Dimensions:  ", nrow(r_travel), "x", ncol(r_travel), "\n")
+# cat("  Resolution:  ", res(r_travel), "degrees\n")
+# cat("  Resolution:  ~", round(res(r_travel)[1] * 111, 2), "km\n")
+# cat("  Extent:      ", as.vector(ext(r_travel)), "\n")
+# 
+# travel_vals <- values(r_travel, na.rm = TRUE)
+# cat("  Value range: ", range(travel_vals), " minutes\n")
+# cat("  Mean:        ", mean(travel_vals), " minutes\n")
+# cat("  Valid cells: ", sum(!is.na(values(r_travel))), "/", ncell(r_travel), "\n\n")
 
 
 # =============================================================================
@@ -208,9 +208,9 @@ total_cattle <- sum(values(r_cattle_aligned * r_land_mask) * cell_area_km2, na.r
 cat("Approximate total cattle: ", round(total_cattle / 1e6, 1), "M\n\n")
 
 ###
-plot(r_cattle_aligned)
-plot(r_pop_aligned)
-plot(r_travel_aligned)
+# plot(r_cattle_aligned)
+# plot(r_pop_aligned)
+# plot(r_travel_aligned)
 
 r_pop_aligned[!r_land_mask] <- NA
 r_cattle_aligned[!r_land_mask] <- NA
@@ -367,11 +367,11 @@ cat("  Travel time to nearest city: median =",
     "range = [", round(min(sampled_travel, na.rm = TRUE)), ",",
     round(max(sampled_travel, na.rm = TRUE)), "] min\n\n")
 
+# --- 5b. For each spillover, determine routing and at-hub status -------------
 
-# --- 5b. For each spillover, find the nearest hub centre ---------------------
-
-# We need to know which hub each spillover is closest to, so we can 
-# extract the swath connecting the spillover to that hub.
+# We need to know which hub each spillover should route toward, so we can 
+# extract the swath connecting the spillover to that hub. We now route toward
+# the nearest hub PATCH CELL (not hub center) for more realistic geography.
 
 # Pre-compute a helper function: great-circle-ish distance in km
 # (equirectangular approximation, fine for distances within Uganda)
@@ -382,68 +382,130 @@ dist_km <- function(lat1, lon1, lat2, lon2) {
   sqrt(dlat^2 + dlon^2)
 }
 
-# For each sampled spillover, find the nearest hub
+# Pre-compute all hub patch cells and their coordinates for efficient lookup
+cat("Pre-computing hub patch cells for routing...\n")
+all_hub_cells <- which(values(r_hub_patches) > 0)
+all_hub_coords <- xyFromCell(r_hub_patches, all_hub_cells)
+all_hub_patch_ids <- values(r_hub_patches)[all_hub_cells]
+
+cat("  Total hub patch cells:", length(all_hub_cells), "\n")
+cat("  Hub patches represented:", length(unique(all_hub_patch_ids)), "\n\n")
+
+# For each sampled spillover, find the nearest hub PATCH CELL (for routing direction)
 sampled_hub_id   <- integer(n_spillover_samples)
 sampled_hub_lat  <- numeric(n_spillover_samples)
 sampled_hub_lon  <- numeric(n_spillover_samples)
 sampled_hub_dist <- numeric(n_spillover_samples)
 
+cat("Finding nearest hub patch cell for each spillover...\n")
 for (i in 1:n_spillover_samples) {
-  # Compute distance from this spillover to every hub centre
+  # Compute distance from this spillover to every hub patch cell
   dists <- dist_km(sampled_lats[i], sampled_lons[i],
-                   hub_info$lat, hub_info$lon)
+                   all_hub_coords[, 2], all_hub_coords[, 1])  # lat, lon
   
-  # Pick the closest hub
-  nearest <- which.min(dists)
-  sampled_hub_id[i]   <- hub_info$hub_id[nearest]
-  sampled_hub_lat[i]  <- hub_info$lat[nearest]
-  sampled_hub_lon[i]  <- hub_info$lon[nearest]
-  sampled_hub_dist[i] <- dists[nearest]
+  # Pick the closest hub patch cell
+  nearest_idx <- which.min(dists)
+  nearest_cell <- all_hub_cells[nearest_idx]
+  
+  # Store the target information
+  sampled_hub_id[i]   <- all_hub_patch_ids[nearest_idx]  # which patch this cell belongs to
+  sampled_hub_lat[i]  <- all_hub_coords[nearest_idx, 2]   # lat of target cell
+  sampled_hub_lon[i]  <- all_hub_coords[nearest_idx, 1]   # lon of target cell
+  sampled_hub_dist[i] <- dists[nearest_idx]               # distance to target
+  
+  if (i %% 100 == 0) {
+    cat(sprintf("  Processed %d / %d spillovers\n", i, n_spillover_samples))
+  }
 }
 
-cat("Distance to nearest hub:\n")
+cat("\nDistance to nearest hub patch cell (for routing):\n")
 cat("  Median:", round(median(sampled_hub_dist)), "km\n")
 cat("  Range: [", round(min(sampled_hub_dist)), ",",
     round(max(sampled_hub_dist)), "] km\n")
 
-# How many spillovers are essentially already at a hub?
-at_hub <- sampled_hub_dist < 5  # within 5 km of hub centre
-cat("  Spillovers at-hub (< 5 km):", sum(at_hub), "\n\n")
+# Determine which spillovers are "at-hub" based on hub PATCH areas
+# If a spillover is already in any hub patch, there's no spatial bottleneck - 
+# it can reach global transport immediately.
+at_hub <- logical(n_spillover_samples)
 
-# Plot cattle density
-plot(r_cattle_aligned, main = "Cattle Density + Hub Patches + Spillover Locations",
+for (i in 1:n_spillover_samples) {
+  # Get the raster cell index for this spillover location
+  spill_cell <- cellFromXY(r_hub_mask, cbind(sampled_lons[i], sampled_lats[i]))
+  
+  # Check if this cell is in any hub patch area (travel time < 30 min)
+  if (!is.na(spill_cell) && spill_cell > 0 && spill_cell <= ncell(r_hub_mask)) {
+    at_hub[i] <- values(r_hub_mask)[spill_cell]
+    # Handle NA values in hub mask
+    if (is.na(at_hub[i])) at_hub[i] <- FALSE
+  } else {
+    at_hub[i] <- FALSE
+  }
+}
+
+cat("  Spillovers at-hub (in hub patch areas):", sum(at_hub), "\n")
+cat("  Spillovers requiring spatial transmission:", sum(!at_hub), "\n")
+
+# Show which hub patches are being targeted
+target_patch_counts <- table(sampled_hub_id[!at_hub])
+cat("  Target hub patches for spatial spillovers:\n")
+for (patch_id in names(target_patch_counts)) {
+  cat(sprintf("    Hub %s: %d spillovers\n", patch_id, target_patch_counts[patch_id]))
+}
+cat("\n")
+
+# Visualize spillover locations, hub areas, and routing targets
+cat("Plotting spillover locations and routing targets...\n")
+
+plot(r_cattle_aligned, main = "Spillover Routing to Nearest Hub Patch Cells",
      col = hcl.colors(50, "Greens", rev = TRUE))
 
-# Overlay hub patches as colored outlines (much better than contour)
-# Create a version of patches with NA where there are no hubs
+# Add hub patches as semi-transparent overlay
 r_hub_outline <- r_hub_patches
 r_hub_outline[r_hub_outline == 0 | is.na(r_hub_outline)] <- NA
+plot(r_hub_outline, add = TRUE, 
+     col = rainbow(length(actual_hub_ids), alpha = 0.4),
+     legend = FALSE)
 
-# Plot hub patches with outlines
-plot(r_hub_outline, add = TRUE, col = NA, 
-     border = "red", lwd = 2, alpha = 0)
-
-# Add jittered spillover locations so overlapping points are visible
-# Jitter by ~1/4 of a cell width in each direction
+# Plot spillovers with different colors and routing lines
 cell_width_deg <- res(r_cattle_aligned)[1]
 jitter_amount <- cell_width_deg * 0.25
-
 jittered_lons <- sampled_lons + runif(length(sampled_lons), -jitter_amount, jitter_amount)
 jittered_lats <- sampled_lats + runif(length(sampled_lats), -jitter_amount, jitter_amount)
 
-points(jittered_lons, jittered_lats, pch = 16, col = "blue", cex = 0.5)
+# At-hub spillovers in red (no spatial bottleneck)
+if (sum(at_hub) > 0) {
+  points(jittered_lons[at_hub], jittered_lats[at_hub], 
+         pch = 16, col = "red", cex = 0.8)
+}
 
-# Add hub ID labels at centers
-text(hub_info$lon, hub_info$lat, labels = hub_info$hub_id, 
-     col = "white", font = 2, cex = 0.8, 
-     # Add black outline to text for better visibility
-     family = "sans")
+# Spatial spillovers in black with routing lines to targets
+if (sum(!at_hub) > 0) {
+  # Plot spillover locations
+  points(jittered_lons[!at_hub], jittered_lats[!at_hub], 
+         pch = 16, col = "black", cex = 0.6)
+  
+  # Draw routing lines (sample a few to avoid clutter)
+  n_lines_to_show <- min(20, sum(!at_hub))
+  spatial_indices <- which(!at_hub)
+  show_indices <- sample(spatial_indices, n_lines_to_show)
+  
+  for (idx in show_indices) {
+    lines(c(sampled_lons[idx], sampled_hub_lon[idx]),
+          c(sampled_lats[idx], sampled_hub_lat[idx]),
+          col = "blue", lwd = 1, lty = 2)
+  }
+  
+  # Mark target hub patch cells
+  points(sampled_hub_lon[show_indices], sampled_hub_lat[show_indices],
+         pch = 17, col = "blue", cex = 0.8)
+}
 
-legend("topright", 
-       legend = c("Hub patches", "Spillover locations"),
-       col = c("red", "blue"), 
-       lty = c(1, NA), 
-       pch = c(NA, 16),
+legend("bottomright", 
+       legend = c("Hub patches", "At-hub spillovers", "Spatial spillovers", 
+                  "Routing lines", "Target cells"),
+       col = c("purple", "red", "black", "blue", "blue"), 
+       pch = c(15, 16, 16, NA, 17),
+       lty = c(NA, NA, NA, 2, NA),
        cex = 0.8, bg = "white")
 
 # --- 5c. Extract 2D swaths --------------------------------------------------
@@ -617,6 +679,75 @@ for (i in 1:n_spillover_samples) {
     cat(sprintf("  Processed %d / %d spillovers\n", i, n_spillover_samples))
   }
 }
+
+## Visualising Swath 
+
+# Find the swath with the largest distance to hub
+max_distance <- 0
+max_distance_idx <- 0
+
+for (i in 1:length(swath_list)) {
+  sw <- swath_list[[i]]
+  
+  # Skip at-hub spillovers (they have no length_km)
+  if (!sw$at_hub && sw$length_km > max_distance) {
+    max_distance <- sw$length_km
+    max_distance_idx <- i
+  }
+}
+
+cat("Swath with largest distance:\n")
+cat("  Index:", max_distance_idx, "\n")
+cat("  Distance:", round(max_distance, 1), "km\n\n")
+
+# Get swath #1 data
+sw1 <- swath_list[[20]]
+
+# Check if it's a spatial swath (not at-hub)
+if (sw1$at_hub) {
+  cat("Swath 1 is at-hub, no spatial structure\n")
+} else {
+  cat("Swath 1 details:\n")
+  cat("  Spillover:", round(sw1$spill_lat, 3), ",", round(sw1$spill_lon, 3), "\n")
+  cat("  Hub:", round(sw1$hub_lat, 3), ",", round(sw1$hub_lon, 3), "\n") 
+  cat("  Distance:", round(sw1$length_km, 1), "km\n")
+  cat("  Swath cells:", sw1$n_cells, "\n")
+  cat("  Hub cells in swath:", sum(sw1$hub_cell_mask), "\n\n")
+  
+  # Plot Uganda map with swath highlighted
+  plot(r_cattle_aligned, main = paste("Swath #1: Spillover to Hub #", sw1$hub_id),
+       col = hcl.colors(50, "Greens", rev = TRUE))
+  
+  # Highlight all swath cells in red
+  points(sw1$cell_lons, sw1$cell_lats, pch = 15, col = "red", cex = 0.3)
+  
+  # Highlight hub cells within the swath in dark red
+  hub_cells_in_swath <- sw1$hub_cell_mask
+  if (sum(hub_cells_in_swath) > 0) {
+    points(sw1$cell_lons[hub_cells_in_swath], sw1$cell_lats[hub_cells_in_swath], 
+           pch = 15, col = "darkred", cex = 0.4)
+  }
+  
+  # Mark spillover location with a star
+  points(sw1$spill_lon, sw1$spill_lat, pch = 8, col = "blue", cex = 2, lwd = 2)
+  
+  # Mark hub center with a triangle  
+  points(sw1$hub_lon, sw1$hub_lat, pch = 17, col = "purple", cex = 2)
+  
+  # Draw a line from spillover to hub
+  lines(c(sw1$spill_lon, sw1$hub_lon), c(sw1$spill_lat, sw1$hub_lat), 
+        col = "black", lwd = 2, lty = 2)
+  
+  # Add legend
+  legend("topright", 
+         legend = c("Spillover", "Hub center", "Swath cells", "Hub cells", "Axis"),
+         col = c("blue", "purple", "red", "darkred", "black"),
+         pch = c(8, 17, 15, 15, NA),
+         lty = c(NA, NA, NA, NA, 2),
+         cex = 0.8, bg = "white")
+}
+
+####
 
 # Summarise
 valid_swaths <- Filter(function(s) !s$at_hub, swath_list)
