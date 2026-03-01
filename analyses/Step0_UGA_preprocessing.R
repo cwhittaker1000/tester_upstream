@@ -63,10 +63,15 @@ n_spillover_samples <- 500
 # and alternative corridors without requiring a full national grid.
 swath_half_width_km <- 20
 
-# Radius (km) around a hub centre within which cells are classified as 
-# "hub cells" in a swath. When cumulative infections in these cells
-# reach N_crit, the outbreak is handed to PanDORA.
-hub_radius_km <- 20
+# Hub expansion radius (km) for swath extraction. After building the basic 
+# transmission corridor from spillover to target hub cell, we expand the swath 
+# to include all hub patch cells within this radius of the target. This gives 
+# outbreaks access to broader urban connectivity once they reach any part of a 
+# city - reflecting the reality that reaching the edge of Kampala provides 
+# access to all of Kampala's transport networks, not just the narrow corridor 
+# the outbreak traveled through. 50km captures most individual urban areas 
+# while avoiding including distant cities.
+hub_expansion_radius_km <- 50
 
 # Random seed for reproducibility
 set.seed(42)
@@ -508,288 +513,323 @@ legend("bottomright",
        lty = c(NA, NA, NA, 2, NA),
        cex = 0.8, bg = "white")
 
-# # --- 5c. Extract 2D swaths --------------------------------------------------
-# 
-# # For each spillover that is NOT at-hub, we extract a rectangular swath of 
-# # cells connecting the spillover to its nearest hub patch cell. The swath is oriented
-# # along the spillover-to-hub-target axis and extends swath_half_width_km on each side.
-# 
-# # Get all grid cell coordinates and data as vectors (for fast subsetting)
-# all_coords  <- xyFromCell(r_cattle_crop, 1:ncell(r_cattle_crop))
-# all_lons    <- all_coords[, 1]
-# all_lats    <- all_coords[, 2]
-# all_pop     <- values(r_pop_aligned)
-# all_cattle  <- values(r_cattle_aligned)
-# all_travel  <- values(r_travel_aligned)
-# all_land    <- values(r_land_mask)
-# # Replace NAs in the land mask with FALSE
-# all_land[is.na(all_land)] <- FALSE
-# 
-# cat("Extracting 2D swaths...\n")
-# 
-# # We'll store each swath as a list. The full collection goes in a list of lists.
-# swath_list <- vector("list", n_spillover_samples)
-# 
-# for (i in 1:n_spillover_samples) {
-#   
-#   # --- Handle at-hub spillovers ---
-#   # If the spillover is already at a hub, there's no spatial bottleneck.
-#   # We store a minimal record and the branching process will run non-spatially.
-#   if (at_hub[i]) {
-#     swath_list[[i]] <- list(
-#       at_hub        = TRUE,
-#       spill_lat     = sampled_lats[i],
-#       spill_lon     = sampled_lons[i],
-#       hub_id        = sampled_hub_id[i],
-#       hub_lat       = sampled_hub_lat[i],
-#       hub_lon       = sampled_hub_lon[i],
-#       travel_time   = sampled_travel[i],
-#       hub_dist_km   = sampled_hub_dist[i]
-#     )
-#     next
-#   }
-#   
-#   # --- Compute the swath geometry ---
-#   
-#   # Vector from spillover to TARGET HUB CELL, in km
-#   # (Note: now routing to nearest hub patch cell, not hub center)
-#   dx <- (sampled_hub_lon[i] - sampled_lons[i]) * 111 * 
-#     cos(sampled_lats[i] * pi / 180)
-#   dy <- (sampled_hub_lat[i] - sampled_lats[i]) * 111
-#   axis_length <- sqrt(dx^2 + dy^2)
-#   
-#   # Unit vector along the spillover-to-hub-target axis
-#   ux <- dx / axis_length
-#   uy <- dy / axis_length
-#   
-#   # Unit vector perpendicular to the axis (rotated 90°)
-#   px <- -uy
-#   py <- ux
-#   
-#   # For every grid cell, compute its displacement from the spillover in km
-#   cell_dx <- (all_lons - sampled_lons[i]) * 111 * 
-#     cos(sampled_lats[i] * pi / 180)
-#   cell_dy <- (all_lats - sampled_lats[i]) * 111
-#   
-#   # Project each cell's displacement onto the axis and perpendicular directions
-#   # "along" = how far along the spillover-to-hub-target axis (0 = at spillover,
-#   #           axis_length = at target hub cell)
-#   # "perp"  = how far off to the side of the axis
-#   along <- cell_dx * ux + cell_dy * uy
-#   perp  <- cell_dx * px + cell_dy * py
-#   
-#   # Select cells that fall within the swath:
-#   # - Along: from 15 km behind the spillover to 15 km past the target
-#   # - Perpendicular: within swath_half_width_km of the axis
-#   # - Must be on land (valid data in all rasters)
-#   in_swath <- which(
-#     all_land &
-#       (along >= -15) &
-#       (along <= axis_length + 15) &
-#       (abs(perp) <= swath_half_width_km)
-#   )
-#   
-#   # If the swath has too few cells, skip (shouldn't happen in practice)
-#   if (length(in_swath) < 5) {
-#     swath_list[[i]] <- list(
-#       at_hub    = TRUE,  # treat as at-hub if we can't build a swath
-#       spill_lat = sampled_lats[i],
-#       spill_lon = sampled_lons[i],
-#       hub_id    = sampled_hub_id[i],
-#       hub_lat   = sampled_hub_lat[i],
-#       hub_lon   = sampled_hub_lon[i],
-#       travel_time = sampled_travel[i],
-#       hub_dist_km = sampled_hub_dist[i],
-#       note      = "swath too small, treating as at-hub"
-#     )
-#     next
-#   }
-#   
-#   # --- Extract cell-level data for the swath ---
-#   
-#   sw_lons   <- all_lons[in_swath]
-#   sw_lats   <- all_lats[in_swath]
-#   sw_pop    <- all_pop[in_swath]         # population density (persons/km²)
-#   sw_cattle <- all_cattle[in_swath]      # cattle density (cattle/km²)
-#   sw_travel <- all_travel[in_swath]      # travel time to nearest city (min)
-#   sw_n      <- length(in_swath)
-#   
-#   # Total population per cell (density * cell area)
-#   sw_pop_total <- sw_pop * cell_area_km2
-#   
-#   # Distance from each swath cell to the TARGET hub cell (km)
-#   sw_dist_to_hub <- dist_km(sw_lats, sw_lons,
-#                             sampled_hub_lat[i], sampled_hub_lon[i])
-#   
-#   # *** KEY FIX: Use hub PATCH areas, not distance to target ***
-#   # Boolean: which swath cells are "hub cells" based on travel time criterion
-#   # (same criterion used for at-hub detection: travel time < 30 min)
-#   sw_hub_mask <- logical(sw_n)
-#   for (j in 1:sw_n) {
-#     # Get the raster cell index for this swath cell
-#     cell_idx <- cellFromXY(r_hub_mask, cbind(sw_lons[j], sw_lats[j]))
-#     
-#     # Check if this cell is in any hub patch area
-#     if (!is.na(cell_idx) && cell_idx > 0 && cell_idx <= ncell(r_hub_mask)) {
-#       sw_hub_mask[j] <- values(r_hub_mask)[cell_idx]
-#       # Handle NA values in hub mask
-#       if (is.na(sw_hub_mask[j])) sw_hub_mask[j] <- FALSE
-#     } else {
-#       sw_hub_mask[j] <- FALSE
-#     }
-#   }
-#   
-#   # Find the index (within the swath) of the cell closest to the spillover.
-#   # This is where the branching process will start (I_{j0}(0) = 1).
-#   sw_dist_to_spill <- dist_km(sw_lats, sw_lons,
-#                               sampled_lats[i], sampled_lons[i])
-#   spill_cell_idx <- which.min(sw_dist_to_spill)
-#   
-#   # --- Compute pairwise distance matrix between all cells in the swath ---
-#   # This is needed for the gravity kernel in the branching process.
-#   # For a swath with N cells, this is an N x N matrix.
-#   # We use the equirectangular approximation (fast and fine for ~100km scales).
-#   
-#   # Coordinates in km (relative to an arbitrary origin; we use the spillover)
-#   sw_x_km <- (sw_lons - sampled_lons[i]) * 111 * 
-#     cos(sampled_lats[i] * pi / 180)
-#   sw_y_km <- (sw_lats - sampled_lats[i]) * 111
-#   
-#   # Pairwise distance matrix: dist_matrix[a, b] = distance in km between 
-#   # swath cell a and swath cell b.
-#   # We only compute this if the swath isn't too large (< 3000 cells).
-#   if (sw_n <= 3000) {
-#     dist_matrix <- as.matrix(dist(cbind(sw_x_km, sw_y_km)))
-#   } else {
-#     # For very large swaths, we'll compute distances on-the-fly during 
-#     # the branching process. Store coordinates instead.
-#     dist_matrix <- NULL
-#   }
-#   
-#   # --- Store the swath ---
-#   swath_list[[i]] <- list(
-#     at_hub          = FALSE,
-#     n_cells         = sw_n,
-#     cell_lons       = sw_lons,
-#     cell_lats       = sw_lats,
-#     cell_pop_density = sw_pop,          # persons per km²
-#     cell_pop_total  = sw_pop_total,     # total persons in cell
-#     cell_cattle     = sw_cattle,        # cattle per km²
-#     cell_travel     = sw_travel,        # minutes to nearest city
-#     cell_dist_to_hub = sw_dist_to_hub,  # km to TARGET hub cell (for reference)
-#     hub_cell_mask   = sw_hub_mask,      # TRUE for cells in ANY hub patch area
-#     spill_cell_idx  = spill_cell_idx,   # index of spillover origin cell
-#     spill_lat       = sampled_lats[i],
-#     spill_lon       = sampled_lons[i],
-#     hub_id          = sampled_hub_id[i],
-#     hub_lat         = sampled_hub_lat[i],  # TARGET hub cell coordinates
-#     hub_lon         = sampled_hub_lon[i],  # TARGET hub cell coordinates
-#     length_km       = axis_length,      # straight-line distance to target
-#     travel_time     = sampled_travel[i],
-#     dist_matrix_km  = dist_matrix,      # N x N pairwise distances (or NULL)
-#     coords_km       = cbind(sw_x_km, sw_y_km)  # Nx2 coordinates in km
-#   )
-#   
-#   # Progress reporting
-#   if (i %% 100 == 0) {
-#     cat(sprintf("  Processed %d / %d spillovers\n", i, n_spillover_samples))
-#   }
-# }
-# 
-# # Summarise valid swaths
-# valid_swaths <- Filter(function(s) !s$at_hub, swath_list)
-# at_hub_swaths <- Filter(function(s) s$at_hub, swath_list)
-# 
-# cat(sprintf("\nTotal swaths:   %d\n", length(swath_list)))
-# cat(sprintf("Valid (spatial): %d\n", length(valid_swaths)))
-# cat(sprintf("At-hub:          %d\n", length(at_hub_swaths)))
-# 
-# if (length(valid_swaths) > 0) {
-#   n_cells_vec <- sapply(valid_swaths, function(s) s$n_cells)
-#   length_vec  <- sapply(valid_swaths, function(s) s$length_km)
-#   hub_cells_vec <- sapply(valid_swaths, function(s) sum(s$hub_cell_mask))
-#   
-#   cat(sprintf("Cells per swath:  median = %d, range = [%d, %d]\n",
-#               median(n_cells_vec), min(n_cells_vec), max(n_cells_vec)))
-#   cat(sprintf("Distance to hub:  median = %.0f km, range = [%.0f, %.0f] km\n",
-#               median(length_vec), min(length_vec), max(length_vec)))
-#   cat(sprintf("Hub cells/swath:  median = %d, range = [%d, %d]\n",
-#               median(hub_cells_vec), min(hub_cells_vec), max(hub_cells_vec)))
-# }
-# 
-# # Find the swath with the largest distance to hub target
-# max_distance <- 0
-# max_distance_idx <- 0
-# 
-# for (i in 1:length(swath_list)) {
-#   sw <- swath_list[[i]]
-#   
-#   # Skip at-hub spillovers (they have no length_km)
-#   if (!sw$at_hub && sw$length_km > max_distance) {
-#     max_distance <- sw$length_km
-#     max_distance_idx <- i
-#   }
-# }
-# 
-# cat(sprintf("\nSwath with largest distance:\n"))
-# cat(sprintf("  Index: %d\n", max_distance_idx))
-# cat(sprintf("  Distance: %.1f km\n\n", max_distance))
-# 
-# # Get the longest swath data
-# sw_longest <- swath_list[[max_distance_idx]]
-# 
-# cat("Longest swath details:\n")
-# cat("  Spillover:", round(sw_longest$spill_lat, 3), ",", round(sw_longest$spill_lon, 3), "\n")
-# cat("  Target:", round(sw_longest$hub_lat, 3), ",", round(sw_longest$hub_lon, 3), "\n") 
-# cat("  Distance:", round(sw_longest$length_km, 1), "km\n")
-# cat("  Swath cells:", sw_longest$n_cells, "\n")
-# cat("  Hub cells in swath:", sum(sw_longest$hub_cell_mask), "\n")
-# cat("  Travel time:", round(sw_longest$travel_time, 0), "minutes\n\n")
-# 
-# # Plot the longest swath
-# plot(r_cattle_aligned, main = paste("Longest Swath (#", max_distance_idx, "): ", 
-#                                     round(max_distance, 0), "km to Hub Patch #", sw_longest$hub_id),
-#      col = hcl.colors(50, "Greens", rev = TRUE))
-# 
-# # Highlight all swath cells in red
-# points(sw_longest$cell_lons, sw_longest$cell_lats, pch = 15, col = "red", cex = 0.3)
-# 
-# # Highlight hub cells within the swath in dark red (using the corrected hub_cell_mask)
-# hub_cells_in_swath <- sw_longest$hub_cell_mask
-# if (sum(hub_cells_in_swath) > 0) {
-#   points(sw_longest$cell_lons[hub_cells_in_swath], sw_longest$cell_lats[hub_cells_in_swath], 
-#          pch = 15, col = "darkred", cex = 0.4)
-# }
-# 
-# # Mark spillover location with a star
-# points(sw_longest$spill_lon, sw_longest$spill_lat, pch = 8, col = "blue", cex = 2, lwd = 2)
-# 
-# # Mark TARGET hub cell with a triangle  
-# points(sw_longest$hub_lon, sw_longest$hub_lat, pch = 17, col = "purple", cex = 2)
-# 
-# # Draw a line from spillover to target
-# lines(c(sw_longest$spill_lon, sw_longest$hub_lon), 
-#       c(sw_longest$spill_lat, sw_longest$hub_lat), 
-#       col = "black", lwd = 2, lty = 2)
-# 
-# # Add distance text along the line
-# mid_lon <- (sw_longest$spill_lon + sw_longest$hub_lon) / 2
-# mid_lat <- (sw_longest$spill_lat + sw_longest$hub_lat) / 2
-# text(mid_lon, mid_lat, paste(round(max_distance, 0), "km"), 
-#      col = "white", font = 2, cex = 0.9, 
-#      bg = "black", pos = 3)
-# 
-# # Add legend
-# legend("topright", 
-#        legend = c("Spillover", "Target hub cell", "Swath cells", "Hub cells", "Axis"),
-#        col = c("blue", "purple", "red", "darkred", "black"),
-#        pch = c(8, 17, 15, 15, NA),
-#        lty = c(NA, NA, NA, NA, 2),
-#        cex = 0.8, bg = "white")
-# 
-# plot(r_hub_outline, add = TRUE, 
-#      col = rainbow(length(actual_hub_ids), alpha = 0.4),
-#      legend = FALSE)
+# --- 5c. Extract 2D swaths --------------------------------------------------
+
+# For each spillover that is NOT at-hub, we extract a rectangular swath of 
+# cells connecting the spillover to its nearest hub patch cell. The swath is oriented
+# along the spillover-to-hub-target axis and extends swath_half_width_km on each side.
+# We then EXPAND the swath to include nearby hub areas for realistic urban connectivity.
+
+# Get all grid cell coordinates and data as vectors (for fast subsetting)
+all_coords  <- xyFromCell(r_cattle_crop, 1:ncell(r_cattle_crop))
+all_lons    <- all_coords[, 1]
+all_lats    <- all_coords[, 2]
+all_pop     <- values(r_pop_aligned)
+all_cattle  <- values(r_cattle_aligned)
+all_travel  <- values(r_travel_aligned)
+all_land    <- values(r_land_mask)
+# Replace NAs in the land mask with FALSE
+all_land[is.na(all_land)] <- FALSE
+
+cat("Extracting 2D swaths with hub expansion...\n")
+
+# Hub expansion parameter for step 5c (swath extraction)
+hub_expansion_radius_km <- 50  # include additional hub cells within this radius of target
+
+# We'll store each swath as a list. The full collection goes in a list of lists.
+swath_list <- vector("list", n_spillover_samples)
+
+for (i in 1:n_spillover_samples) {
+  
+  # --- Handle at-hub spillovers ---
+  # If the spillover is already at a hub, there's no spatial bottleneck.
+  # We store a minimal record and the branching process will run non-spatially.
+  if (at_hub[i]) {
+    swath_list[[i]] <- list(
+      at_hub        = TRUE,
+      spill_lat     = sampled_lats[i],
+      spill_lon     = sampled_lons[i],
+      hub_id        = sampled_hub_id[i],
+      hub_lat       = sampled_hub_lat[i],
+      hub_lon       = sampled_hub_lon[i],
+      travel_time   = sampled_travel[i],
+      hub_dist_km   = sampled_hub_dist[i]
+    )
+    next
+  }
+  
+  # --- Compute the swath geometry ---
+  
+  # Vector from spillover to TARGET HUB CELL, in km
+  # (Note: now routing to nearest hub patch cell, not hub center)
+  dx <- (sampled_hub_lon[i] - sampled_lons[i]) * 111 * 
+    cos(sampled_lats[i] * pi / 180)
+  dy <- (sampled_hub_lat[i] - sampled_lats[i]) * 111
+  axis_length <- sqrt(dx^2 + dy^2)
+  
+  # Unit vector along the spillover-to-hub-target axis
+  ux <- dx / axis_length
+  uy <- dy / axis_length
+  
+  # Unit vector perpendicular to the axis (rotated 90°)
+  px <- -uy
+  py <- ux
+  
+  # For every grid cell, compute its displacement from the spillover in km
+  cell_dx <- (all_lons - sampled_lons[i]) * 111 * 
+    cos(sampled_lats[i] * pi / 180)
+  cell_dy <- (all_lats - sampled_lats[i]) * 111
+  
+  # Project each cell's displacement onto the axis and perpendicular directions
+  # "along" = how far along the spillover-to-hub-target axis (0 = at spillover,
+  #           axis_length = at target hub cell)
+  # "perp"  = how far off to the side of the axis
+  along <- cell_dx * ux + cell_dy * uy
+  perp  <- cell_dx * px + cell_dy * py
+  
+  # Select cells that fall within the basic swath:
+  # - Along: from swath_half_width_km behind the spillover to swath_half_width_km past the target
+  # - Perpendicular: within swath_half_width_km of the axis
+  # - Must be on land (valid data in all rasters)
+  in_swath <- which(
+    all_land &
+      (along >= -swath_half_width_km ) &
+      (along <= axis_length + swath_half_width_km ) &
+      (abs(perp) <= swath_half_width_km)
+  )
+  
+  # --- Expand swath to include nearby hub patch areas ---
+  # Once we have the basic transmission corridor, add nearby hub cells
+  # to give the outbreak access to broader urban connectivity
+  
+  # Calculate distances from the TARGET hub cell to all other hub patch cells
+  target_to_hub_dists <- dist_km(rep(sampled_hub_lat[i], nrow(all_hub_coords)),
+                                 rep(sampled_hub_lon[i], nrow(all_hub_coords)),
+                                 all_hub_coords[, 2], all_hub_coords[, 1])
+  
+  # Find hub cells within expansion radius of the target
+  nearby_hub_cells <- all_hub_cells[target_to_hub_dists < hub_expansion_radius_km]
+  
+  # Find which nearby hub cells are NOT already included in the basic swath
+  # Convert swath cell indices to cell numbers for comparison
+  swath_cell_numbers <- cellFromXY(r_cattle_crop, cbind(all_lons[in_swath], all_lats[in_swath]))
+  new_hub_cells <- setdiff(nearby_hub_cells, swath_cell_numbers)
+  
+  # Combine basic swath with expansion cells
+  all_swath_cells <- c(in_swath, which(1:ncell(r_cattle_crop) %in% new_hub_cells))
+  
+  # If the swath has too few cells, skip (shouldn't happen in practice)
+  if (length(all_swath_cells) < 5) {
+    swath_list[[i]] <- list(
+      at_hub    = TRUE,  # treat as at-hub if we can't build a swath
+      spill_lat = sampled_lats[i],
+      spill_lon = sampled_lons[i],
+      hub_id    = sampled_hub_id[i],
+      hub_lat   = sampled_hub_lat[i],
+      hub_lon   = sampled_hub_lon[i],
+      travel_time = sampled_travel[i],
+      hub_dist_km = sampled_hub_dist[i],
+      note      = "swath too small, treating as at-hub"
+    )
+    next
+  }
+  
+  # Report expansion
+  n_expansion_cells <- length(new_hub_cells)
+  if (n_expansion_cells > 0 && i <= 10) {  # Report for first few swaths
+    cat(sprintf("  Swath %d: added %d hub expansion cells (%.0f km radius)\n", 
+                i, n_expansion_cells, hub_expansion_radius_km))
+  }
+  
+  # --- Extract cell-level data for the expanded swath ---
+  
+  sw_lons   <- all_lons[all_swath_cells]
+  sw_lats   <- all_lats[all_swath_cells]
+  sw_pop    <- all_pop[all_swath_cells]         # population density (persons/km²)
+  sw_cattle <- all_cattle[all_swath_cells]      # cattle density (cattle/km²)
+  sw_travel <- all_travel[all_swath_cells]      # travel time to nearest city (min)
+  sw_n      <- length(all_swath_cells)
+  
+  # Total population per cell (density * cell area)
+  sw_pop_total <- sw_pop * cell_area_km2
+  
+  # Distance from each swath cell to the TARGET hub cell (km)
+  sw_dist_to_hub <- dist_km(sw_lats, sw_lons,
+                            sampled_hub_lat[i], sampled_hub_lon[i])
+  
+  # *** KEY FIX: Use hub PATCH areas, not distance to target ***
+  # Boolean: which swath cells are "hub cells" based on travel time criterion
+  # (same criterion used for at-hub detection: travel time < 30 min)
+  sw_hub_mask <- logical(sw_n)
+  for (j in 1:sw_n) {
+    # Get the raster cell index for this swath cell
+    cell_idx <- cellFromXY(r_hub_mask, cbind(sw_lons[j], sw_lats[j]))
+    
+    # Check if this cell is in any hub patch area
+    if (!is.na(cell_idx) && cell_idx > 0 && cell_idx <= ncell(r_hub_mask)) {
+      sw_hub_mask[j] <- values(r_hub_mask)[cell_idx]
+      # Handle NA values in hub mask
+      if (is.na(sw_hub_mask[j])) sw_hub_mask[j] <- FALSE
+    } else {
+      sw_hub_mask[j] <- FALSE
+    }
+  }
+  
+  # Find the index (within the swath) of the cell closest to the spillover.
+  # This is where the branching process will start (I_{j0}(0) = 1).
+  sw_dist_to_spill <- dist_km(sw_lats, sw_lons,
+                              sampled_lats[i], sampled_lons[i])
+  spill_cell_idx <- which.min(sw_dist_to_spill)
+  
+  # --- Compute pairwise distance matrix between all cells in the swath ---
+  # This is needed for the gravity kernel in the branching process.
+  # For a swath with N cells, this is an N x N matrix.
+  # We use the equirectangular approximation (fast and fine for ~100km scales).
+  
+  # Coordinates in km (relative to an arbitrary origin; we use the spillover)
+  sw_x_km <- (sw_lons - sampled_lons[i]) * 111 * 
+    cos(sampled_lats[i] * pi / 180)
+  sw_y_km <- (sw_lats - sampled_lats[i]) * 111
+  
+  # Pairwise distance matrix: dist_matrix[a, b] = distance in km between 
+  # swath cell a and swath cell b.
+  # We only compute this if the swath isn't too large (< 3000 cells).
+  if (sw_n <= 3000) {
+    dist_matrix <- as.matrix(dist(cbind(sw_x_km, sw_y_km)))
+  } else {
+    # For very large swaths, we'll compute distances on-the-fly during 
+    # the branching process. Store coordinates instead.
+    dist_matrix <- NULL
+  }
+  
+  # --- Store the swath ---
+  swath_list[[i]] <- list(
+    at_hub          = FALSE,
+    n_cells         = sw_n,
+    n_expansion_cells = n_expansion_cells,  # Track how many cells added by expansion
+    cell_lons       = sw_lons,
+    cell_lats       = sw_lats,
+    cell_pop_density = sw_pop,          # persons per km²
+    cell_pop_total  = sw_pop_total,     # total persons in cell
+    cell_cattle     = sw_cattle,        # cattle per km²
+    cell_travel     = sw_travel,        # minutes to nearest city
+    cell_dist_to_hub = sw_dist_to_hub,  # km to TARGET hub cell (for reference)
+    hub_cell_mask   = sw_hub_mask,      # TRUE for cells in ANY hub patch area
+    spill_cell_idx  = spill_cell_idx,   # index of spillover origin cell
+    spill_lat       = sampled_lats[i],
+    spill_lon       = sampled_lons[i],
+    hub_id          = sampled_hub_id[i],
+    hub_lat         = sampled_hub_lat[i],  # TARGET hub cell coordinates
+    hub_lon         = sampled_hub_lon[i],  # TARGET hub cell coordinates
+    length_km       = axis_length,      # straight-line distance to target
+    travel_time     = sampled_travel[i],
+    dist_matrix_km  = dist_matrix,      # N x N pairwise distances (or NULL)
+    coords_km       = cbind(sw_x_km, sw_y_km)  # Nx2 coordinates in km
+  )
+  
+  # Progress reporting
+  if (i %% 100 == 0) {
+    cat(sprintf("  Processed %d / %d spillovers\n", i, n_spillover_samples))
+  }
+}
+
+# Summarise valid swaths with expansion info
+valid_swaths <- Filter(function(s) !s$at_hub, swath_list)
+at_hub_swaths <- Filter(function(s) s$at_hub, swath_list)
+
+cat(sprintf("\nTotal swaths:   %d\n", length(swath_list)))
+cat(sprintf("Valid (spatial): %d\n", length(valid_swaths)))
+cat(sprintf("At-hub:          %d\n", length(at_hub_swaths)))
+
+if (length(valid_swaths) > 0) {
+  n_cells_vec <- sapply(valid_swaths, function(s) s$n_cells)
+  length_vec  <- sapply(valid_swaths, function(s) s$length_km)
+  hub_cells_vec <- sapply(valid_swaths, function(s) sum(s$hub_cell_mask))
+  expansion_vec <- sapply(valid_swaths, function(s) s$n_expansion_cells)
+  
+  cat(sprintf("Cells per swath:      median = %d, range = [%d, %d]\n",
+              median(n_cells_vec), min(n_cells_vec), max(n_cells_vec)))
+  cat(sprintf("Distance to hub:      median = %.0f km, range = [%.0f, %.0f] km\n",
+              median(length_vec), min(length_vec), max(length_vec)))
+  cat(sprintf("Hub cells/swath:      median = %d, range = [%d, %d]\n",
+              median(hub_cells_vec), min(hub_cells_vec), max(hub_cells_vec)))
+  cat(sprintf("Expansion cells/swath: median = %d, range = [%d, %d]\n",
+              median(expansion_vec), min(expansion_vec), max(expansion_vec)))
+}
+
+# Find the swath with the largest distance to hub target
+max_distance <- 0
+max_distance_idx <- 0
+
+for (i in 1:length(swath_list)) {
+  sw <- swath_list[[i]]
+
+  # Skip at-hub spillovers (they have no length_km)
+  if (!sw$at_hub && sw$length_km > max_distance) {
+    max_distance <- sw$length_km
+    max_distance_idx <- i
+  }
+}
+
+cat(sprintf("\nSwath with largest distance:\n"))
+cat(sprintf("  Index: %d\n", max_distance_idx))
+cat(sprintf("  Distance: %.1f km\n\n", max_distance))
+
+# Get the longest swath data
+sw_longest <- swath_list[[max_distance_idx]]
+
+cat("Longest swath details:\n")
+cat("  Spillover:", round(sw_longest$spill_lat, 3), ",", round(sw_longest$spill_lon, 3), "\n")
+cat("  Target:", round(sw_longest$hub_lat, 3), ",", round(sw_longest$hub_lon, 3), "\n")
+cat("  Distance:", round(sw_longest$length_km, 1), "km\n")
+cat("  Swath cells:", sw_longest$n_cells, "\n")
+cat("  Hub cells in swath:", sum(sw_longest$hub_cell_mask), "\n")
+cat("  Travel time:", round(sw_longest$travel_time, 0), "minutes\n\n")
+
+# Plot the longest swath
+plot(r_cattle_aligned, main = paste("Longest Swath (#", max_distance_idx, "): ",
+                                    round(max_distance, 0), "km to Hub Patch #", sw_longest$hub_id),
+     col = hcl.colors(50, "Greens", rev = TRUE))
+
+# Highlight all swath cells in red
+points(sw_longest$cell_lons, sw_longest$cell_lats, pch = 15, col = "red", cex = 0.3)
+
+# Highlight hub cells within the swath in dark red (using the corrected hub_cell_mask)
+hub_cells_in_swath <- sw_longest$hub_cell_mask
+if (sum(hub_cells_in_swath) > 0) {
+  points(sw_longest$cell_lons[hub_cells_in_swath], sw_longest$cell_lats[hub_cells_in_swath],
+         pch = 15, col = "darkred", cex = 0.4)
+}
+
+# Mark spillover location with a star
+points(sw_longest$spill_lon, sw_longest$spill_lat, pch = 8, col = "blue", cex = 2, lwd = 2)
+
+# Mark TARGET hub cell with a triangle
+points(sw_longest$hub_lon, sw_longest$hub_lat, pch = 17, col = "purple", cex = 2)
+
+# Draw a line from spillover to target
+lines(c(sw_longest$spill_lon, sw_longest$hub_lon),
+      c(sw_longest$spill_lat, sw_longest$hub_lat),
+      col = "black", lwd = 2, lty = 2)
+
+# Add distance text along the line
+mid_lon <- (sw_longest$spill_lon + sw_longest$hub_lon) / 2
+mid_lat <- (sw_longest$spill_lat + sw_longest$hub_lat) / 2
+text(mid_lon, mid_lat, paste(round(max_distance, 0), "km"),
+     col = "white", font = 2, cex = 0.9,
+     bg = "black", pos = 3)
+
+# Add legend
+legend("topright",
+       legend = c("Spillover", "Target hub cell", "Swath cells", "Hub cells", "Axis"),
+       col = c("blue", "purple", "red", "darkred", "black"),
+       pch = c(8, 17, 15, 15, NA),
+       lty = c(NA, NA, NA, NA, 2),
+       cex = 0.8, bg = "white")
+
+plot(r_hub_outline, add = TRUE,
+     col = rainbow(length(actual_hub_ids), alpha = 0.4),
+     legend = FALSE)
 
 ## Zooming in on the swath area
 # Calculate zoom bounds around the longest swath
@@ -849,247 +889,6 @@ legend("right",
        pch = c(8, 17, 15, 15, NA),
        lty = c(NA, NA, NA, NA, 2),
        cex = 0.8, bg = "white")
-
-# # --- 5c. Extract 2D swaths --------------------------------------------------
-# 
-# # For each spillover that is NOT at-hub, we extract a rectangular swath of 
-# # cells connecting the spillover to its nearest hub. The swath is oriented
-# # along the spillover-to-hub axis and extends swath_half_width_km on each side.
-# 
-# # Get all grid cell coordinates and data as vectors (for fast subsetting)
-# all_coords  <- xyFromCell(r_cattle_crop, 1:ncell(r_cattle_crop))
-# all_lons    <- all_coords[, 1]
-# all_lats    <- all_coords[, 2]
-# all_pop     <- values(r_pop_aligned)
-# all_cattle  <- values(r_cattle_aligned)
-# all_travel  <- values(r_travel_aligned)
-# all_land    <- values(r_land_mask)
-# # Replace NAs in the land mask with FALSE
-# all_land[is.na(all_land)] <- FALSE
-# 
-# cat("Extracting 2D swaths...\n")
-# 
-# # We'll store each swath as a list. The full collection goes in a list of lists.
-# swath_list <- vector("list", n_spillover_samples)
-# 
-# for (i in 1:n_spillover_samples) {
-#   
-#   # --- Handle at-hub spillovers ---
-#   # If the spillover is already at a hub, there's no spatial bottleneck.
-#   # We store a minimal record and the branching process will run non-spatially.
-#   if (at_hub[i]) {
-#     swath_list[[i]] <- list(
-#       at_hub        = TRUE,
-#       spill_lat     = sampled_lats[i],
-#       spill_lon     = sampled_lons[i],
-#       hub_id        = sampled_hub_id[i],
-#       hub_lat       = sampled_hub_lat[i],
-#       hub_lon       = sampled_hub_lon[i],
-#       travel_time   = sampled_travel[i],
-#       hub_dist_km   = sampled_hub_dist[i]
-#     )
-#     next
-#   }
-#   
-#   # --- Compute the swath geometry ---
-#   
-#   # Vector from spillover to hub, in km
-#   dx <- (sampled_hub_lon[i] - sampled_lons[i]) * 111 * 
-#     cos(sampled_lats[i] * pi / 180)
-#   dy <- (sampled_hub_lat[i] - sampled_lats[i]) * 111
-#   axis_length <- sqrt(dx^2 + dy^2)
-#   
-#   # Unit vector along the spillover-to-hub axis
-#   ux <- dx / axis_length
-#   uy <- dy / axis_length
-#   
-#   # Unit vector perpendicular to the axis (rotated 90°)
-#   px <- -uy
-#   py <- ux
-#   
-#   # For every grid cell, compute its displacement from the spillover in km
-#   cell_dx <- (all_lons - sampled_lons[i]) * 111 * 
-#     cos(sampled_lats[i] * pi / 180)
-#   cell_dy <- (all_lats - sampled_lats[i]) * 111
-#   
-#   # Project each cell's displacement onto the axis and perpendicular directions
-#   # "along" = how far along the spillover-to-hub axis (0 = at spillover,
-#   #           axis_length = at hub)
-#   # "perp"  = how far off to the side of the axis
-#   along <- cell_dx * ux + cell_dy * uy
-#   perp  <- cell_dx * px + cell_dy * py
-#   
-#   # Select cells that fall within the swath:
-#   # - Along: from 15 km behind the spillover to 15 km past the hub
-#   # - Perpendicular: within swath_half_width_km of the axis
-#   # - Must be on land (valid data in all rasters)
-#   in_swath <- which(
-#     all_land &
-#       (along >= -15) &
-#       (along <= axis_length + 15) &
-#       (abs(perp) <= swath_half_width_km)
-#   )
-#   
-#   # If the swath has too few cells, skip (shouldn't happen in practice)
-#   if (length(in_swath) < 5) {
-#     swath_list[[i]] <- list(
-#       at_hub    = TRUE,  # treat as at-hub if we can't build a swath
-#       spill_lat = sampled_lats[i],
-#       spill_lon = sampled_lons[i],
-#       hub_id    = sampled_hub_id[i],
-#       hub_lat   = sampled_hub_lat[i],
-#       hub_lon   = sampled_hub_lon[i],
-#       travel_time = sampled_travel[i],
-#       hub_dist_km = sampled_hub_dist[i],
-#       note      = "swath too small, treating as at-hub"
-#     )
-#     next
-#   }
-#   
-#   # --- Extract cell-level data for the swath ---
-#   
-#   sw_lons   <- all_lons[in_swath]
-#   sw_lats   <- all_lats[in_swath]
-#   sw_pop    <- all_pop[in_swath]         # population density (persons/km²)
-#   sw_cattle <- all_cattle[in_swath]      # cattle density (cattle/km²)
-#   sw_travel <- all_travel[in_swath]      # travel time to nearest city (min)
-#   sw_n      <- length(in_swath)
-#   
-#   # Total population per cell (density * cell area)
-#   sw_pop_total <- sw_pop * cell_area_km2
-#   
-#   # Distance from each swath cell to the hub centre (km)
-#   sw_dist_to_hub <- dist_km(sw_lats, sw_lons,
-#                             sampled_hub_lat[i], sampled_hub_lon[i])
-#   
-#   # Boolean: which swath cells are "hub cells" (within hub_radius_km of hub)
-#   sw_hub_mask <- sw_dist_to_hub < hub_radius_km
-#   
-#   # Find the index (within the swath) of the cell closest to the spillover.
-#   # This is where the branching process will start (I_{j0}(0) = 1).
-#   sw_dist_to_spill <- dist_km(sw_lats, sw_lons,
-#                               sampled_lats[i], sampled_lons[i])
-#   spill_cell_idx <- which.min(sw_dist_to_spill)
-#   
-#   # --- Compute pairwise distance matrix between all cells in the swath ---
-#   # This is needed for the gravity kernel in the branching process.
-#   # For a swath with N cells, this is an N x N matrix.
-#   # We use the equirectangular approximation (fast and fine for ~100km scales).
-#   
-#   # Coordinates in km (relative to an arbitrary origin; we use the spillover)
-#   sw_x_km <- (sw_lons - sampled_lons[i]) * 111 * 
-#     cos(sampled_lats[i] * pi / 180)
-#   sw_y_km <- (sw_lats - sampled_lats[i]) * 111
-#   
-#   # Pairwise distance matrix: dist_matrix[a, b] = distance in km between 
-#   # swath cell a and swath cell b.
-#   # We only compute this if the swath isn't too large (< 3000 cells).
-#   if (sw_n <= 3000) {
-#     dist_matrix <- as.matrix(dist(cbind(sw_x_km, sw_y_km)))
-#   } else {
-#     # For very large swaths, we'll compute distances on-the-fly during 
-#     # the branching process. Store coordinates instead.
-#     dist_matrix <- NULL
-#   }
-#   
-#   # --- Store the swath ---
-#   swath_list[[i]] <- list(
-#     at_hub          = FALSE,
-#     n_cells         = sw_n,
-#     cell_lons       = sw_lons,
-#     cell_lats       = sw_lats,
-#     cell_pop_density = sw_pop,          # persons per km²
-#     cell_pop_total  = sw_pop_total,     # total persons in cell
-#     cell_cattle     = sw_cattle,        # cattle per km²
-#     cell_travel     = sw_travel,        # minutes to nearest city
-#     cell_dist_to_hub = sw_dist_to_hub,  # km to hub centre
-#     hub_cell_mask   = sw_hub_mask,      # TRUE for hub cells
-#     spill_cell_idx  = spill_cell_idx,   # index of spillover origin cell
-#     spill_lat       = sampled_lats[i],
-#     spill_lon       = sampled_lons[i],
-#     hub_id          = sampled_hub_id[i],
-#     hub_lat         = sampled_hub_lat[i],
-#     hub_lon         = sampled_hub_lon[i],
-#     length_km       = axis_length,      # straight-line distance to hub
-#     travel_time     = sampled_travel[i],
-#     dist_matrix_km  = dist_matrix,      # N x N pairwise distances (or NULL)
-#     coords_km       = cbind(sw_x_km, sw_y_km)  # Nx2 coordinates in km
-#   )
-#   
-#   # Progress reporting
-#   if (i %% 100 == 0) {
-#     cat(sprintf("  Processed %d / %d spillovers\n", i, n_spillover_samples))
-#   }
-# }
-# 
-# ## Visualising Swath 
-# 
-# # Find the swath with the largest distance to hub
-# max_distance <- 0
-# max_distance_idx <- 0
-# 
-# for (i in 1:length(swath_list)) {
-#   sw <- swath_list[[i]]
-#   
-#   # Skip at-hub spillovers (they have no length_km)
-#   if (!sw$at_hub && sw$length_km > max_distance) {
-#     max_distance <- sw$length_km
-#     max_distance_idx <- i
-#   }
-# }
-# 
-# cat("Swath with largest distance:\n")
-# cat("  Index:", max_distance_idx, "\n")
-# cat("  Distance:", round(max_distance, 1), "km\n\n")
-# 
-# # Get swath #1 data
-# sw1 <- swath_list[[20]]
-# 
-# # Check if it's a spatial swath (not at-hub)
-# if (sw1$at_hub) {
-#   cat("Swath 1 is at-hub, no spatial structure\n")
-# } else {
-#   cat("Swath 1 details:\n")
-#   cat("  Spillover:", round(sw1$spill_lat, 3), ",", round(sw1$spill_lon, 3), "\n")
-#   cat("  Hub:", round(sw1$hub_lat, 3), ",", round(sw1$hub_lon, 3), "\n") 
-#   cat("  Distance:", round(sw1$length_km, 1), "km\n")
-#   cat("  Swath cells:", sw1$n_cells, "\n")
-#   cat("  Hub cells in swath:", sum(sw1$hub_cell_mask), "\n\n")
-#   
-#   # Plot Uganda map with swath highlighted
-#   plot(r_cattle_aligned, main = paste("Swath #1: Spillover to Hub #", sw1$hub_id),
-#        col = hcl.colors(50, "Greens", rev = TRUE))
-#   
-#   # Highlight all swath cells in red
-#   points(sw1$cell_lons, sw1$cell_lats, pch = 15, col = "red", cex = 0.3)
-#   
-#   # Highlight hub cells within the swath in dark red
-#   hub_cells_in_swath <- sw1$hub_cell_mask
-#   if (sum(hub_cells_in_swath) > 0) {
-#     points(sw1$cell_lons[hub_cells_in_swath], sw1$cell_lats[hub_cells_in_swath], 
-#            pch = 15, col = "darkred", cex = 0.4)
-#   }
-#   
-#   # Mark spillover location with a star
-#   points(sw1$spill_lon, sw1$spill_lat, pch = 8, col = "blue", cex = 2, lwd = 2)
-#   
-#   # Mark hub center with a triangle  
-#   points(sw1$hub_lon, sw1$hub_lat, pch = 17, col = "purple", cex = 2)
-#   
-#   # Draw a line from spillover to hub
-#   lines(c(sw1$spill_lon, sw1$hub_lon), c(sw1$spill_lat, sw1$hub_lat), 
-#         col = "black", lwd = 2, lty = 2)
-#   
-#   # Add legend
-#   legend("topright", 
-#          legend = c("Spillover", "Hub center", "Swath cells", "Hub cells", "Axis"),
-#          col = c("blue", "purple", "red", "darkred", "black"),
-#          pch = c(8, 17, 15, 15, NA),
-#          lty = c(NA, NA, NA, NA, 2),
-#          cex = 0.8, bg = "white")
-# }
-# 
-# ####
 
 # Summarise
 valid_swaths <- Filter(function(s) !s$at_hub, swath_list)
