@@ -1,0 +1,168 @@
+---
+title: "Stage 0: Uganda Spillover-Pandemic Pipeline Data Processing"
+author: "Spillover Pipeline Documentation"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Overview
+
+This R script implements **Stage 0** of the spillover-pandemic pipeline: the pre-processing phase that transforms raw geospatial data into a library of pre-computed transmission corridors for Uganda.
+
+## The Big Picture
+
+**Goal:** Link ecological influenza spillover models (which predict spillover events by location) to global pandemic simulation models (PanDORA) through an explicit spatial bottleneck.
+
+**Problem:** Most spillovers fail to reach urban connectivity. We need to model the spatial transmission process from rural spillover sites to urban hubs where pandemic spread can begin.
+
+**Solution:** Pre-compute a library of "swaths" (transmission corridors) connecting spillover locations to their nearest urban hub, then run branching process simulations on these corridors.
+
+------------------------------------------------------------------------
+
+# Data Inputs
+
+Three geospatial rasters for Uganda:
+
+1.  **Population density** (`uga_pd_2020_1km.tif`): WorldPop estimates, \~1km resolution, persons/km²
+2.  **Cattle density** (`GLW4-2020.D-DA.CTL.tif`): FAO GLW4 data, \~10km resolution, cattle/km²\
+3.  **Travel time** (`201501_Global_Travel_Time_to_Cities_UGA.tiff`): Weiss et al. (2018), \~1km resolution, minutes to nearest city ≥50k population
+
+------------------------------------------------------------------------
+
+# Step-by-Step Process
+
+## Step 1: Load and Inspect Rasters
+
+-   Loads the three input rasters
+-   Reports dimensions, resolution, extent, data ranges
+-   Identifies any data quality issues
+
+## Step 2: Align Rasters to Common Grid
+
+-   **Problem:** Three rasters have different resolutions and may have different coverage
+-   **Solution:** Resample everything to match the cattle raster (\~10km grid)
+-   **Method:** Aggregate high-resolution rasters (population, travel) using mean values
+-   **Output:** Three aligned rasters + land mask (cells with valid data in all three)
+
+**Key insight:** We align to the *coarsest* resolution to avoid fabricating sub-pixel detail.
+
+## Step 3: Build Spillover Probability Surface
+
+**Formula:** `π(j) ∝ L(j) × P(j)^γ`
+
+Where: - `L(j)` = cattle density in cell j\
+- `P(j)` = population density in cell j - `γ` = population exponent (default 1.0)
+
+**Rationale:** Spillover requires contact between infected animals and humans. Rate scales with both livestock and human density.
+
+**Current setting:** `γ = 0.001` heavily weights cattle density over population (spillovers concentrated in pastoral areas regardless of human density).
+
+## Step 4: Identify Urban Hub Cells
+
+**Hub cells** = cells with travel time \< 30 minutes to nearest city ≥50k - Represents urban footprint / areas with good connectivity - Groups connected hub cells into distinct "hub patches" (separate cities) - Each patch gets a unique ID and centroid coordinates
+
+**Output:** Hub mask + hub patches raster + metadata table
+
+## Step 5: Sample Spillover Locations and Extract Swaths
+
+### 5a: Sample Spillover Locations
+
+-   Samples 500 spillover locations weighted by spillover probability
+-   Records coordinates and travel times for each
+
+### 5b: Route to Nearest Hub
+
+-   **Innovation:** Routes each spillover to nearest *hub patch cell* (not geometric center)
+-   Finds shortest distance to any accessible part of any city
+-   Classifies spillovers as "at-hub" (already in urban area) vs "spatial" (need transmission corridor)
+
+### 5c: Extract 2D Swaths
+
+For each "spatial" spillover:
+
+1.  **Basic corridor:** Rectangular swath from spillover to target hub cell
+    -   Width: ±20km from spillover-hub axis
+    -   Length: 20km behind spillover to 20km past target
+2.  **Hub expansion:** Add any hub patch cells within 50km of target
+    -   Ensures outbreaks get full urban connectivity once they reach any part of a city
+    -   Reflects reality: reaching edge of Kampala = access to all of Kampala's transport
+
+**Output:** Library of \~400 spatial swaths, each containing: - Cell coordinates, population, cattle density, travel times - Hub cell mask (which cells count as "urban")\
+- Distance matrices for gravity kernel - Spillover origin and target locations
+
+## Step 6: Pre-compute Gravity Kernels
+
+For each cell j in each swath, computes transmission probability to every other cell ℓ:
+
+**Formula:** `P(ℓ|j) = w_jℓ / Σ_m w_jm`
+
+Where: - `w_jℓ = N_ℓ^α × exp(-β × d_jℓ)` (between different cells) - `w_jj = N_j^α + w_self` (within same cell)
+
+**Parameters:** - `α = 1.0`: population attractiveness exponent - `β = 0.1`: distance decay (10km characteristic length)\
+- `w_self = 100`: extra weight for local transmission
+
+**Result:** Pre-computed probability matrices for fast branching process simulation.
+
+## Step 7: Save Everything
+
+-   Aligned rasters as GeoTIFF files
+-   Complete swath library as `swath_library.rds`
+-   All parameters and metadata
+
+------------------------------------------------------------------------
+
+# Key Parameters
+
+| Parameter | Value | Meaning |
+|----------------------------|---------------------|-----------------------|
+| `gamma` | 0.001 | Population exponent in spillover probability |
+| `hub_travel_time_threshold` | 30 min | Travel time defining "urban" connectivity |
+| `n_spillover_samples` | 500 | Number of spillover locations to pre-sample |
+| `swath_half_width_km` | 20 km | Half-width of transmission corridors |
+| `hub_expansion_radius_km` | 50 km | Radius for including nearby hub areas |
+| `alpha_gravity` | 1.0 | Population attraction in transmission kernel |
+| `beta_gravity` | 0.1 | Distance decay rate (1/10km) |
+| `w_self_gravity` | 100 | Extra weight for within-cell transmission |
+
+------------------------------------------------------------------------
+
+# Output Data Structures
+
+## Main Output: `swath_library.rds`
+
+Contains: - **`swaths`**: List of 500 spillover scenarios, each with: - `at_hub`: Boolean (TRUE = no spatial bottleneck needed) - `cell_lons`, `cell_lats`: Coordinates of all cells in corridor\
+- `cell_pop_total`: Total population per cell - `hub_cell_mask`: Which cells are urban hubs - `kernel_matrix`: Pre-computed transmission probabilities - `spill_cell_idx`: Where branching process starts - Spillover and target coordinates, travel times, distances
+
+-   **`hub_info`**: Metadata on distinct urban areas
+-   **`params`**: All parameter values used
+
+## Secondary Outputs
+
+-   Aligned raster files for visualization
+-   Summary plots and diagnostics
+
+------------------------------------------------------------------------
+
+# What Happens Next
+
+This pre-processing enables the simulation pipeline:
+
+1.  **Sample spillover event** from ecological model output
+2.  **Select a swath** from the library (matching spillover location)\
+3.  **Draw R₀** from calibrated distribution
+4.  **Run branching process** on the swath using pre-computed kernels
+5.  **Check for hub establishment** (cumulative infections ≥ N_crit in hub cells)
+6.  **Hand to PanDORA** if successful, or record contained outbreak
+
+The pre-computed swaths make this fast: no real-time geospatial processing needed.
+
+------------------------------------------------------------------------
+
+# Epidemiological Intuition
+
+**Spatial bottleneck hypothesis:** Even viruses with R₀ \> 1 usually fail to reach urban connectivity due to: - Stochastic extinction during spatial relay - Susceptible depletion in sparse rural populations\
+- Lateral diffusion diluting forward momentum - Need to establish substantial infections in hub areas
+
+This explains why most zoonotic influenza (H5N1, H7N9) causes family clusters but rarely sustains transmission, while pandemic strains (1918, 2009) combine favorable R₀ with successful urban establishment.
+
+The pipeline quantifies this process to estimate realistic pandemic probabilities from ecological spillover predictions.
