@@ -74,6 +74,19 @@ swath_half_width_km <- 20
 # while avoiding including distant cities.
 hub_expansion_radius_km <- 50
 
+# Buffer radius (km) for computing gravity kernel capture fractions.
+# The swath-normalised kernel implicitly assumes all offspring land within the 
+# swath. In reality, transmission is radial: some offspring would land outside 
+# the swath and are epidemiologically "lost" (they don't help the outbreak 
+# reach the hub). To correct for this, we compute the total gravity weight 
+# from each swath cell to all national land cells within this buffer radius, 
+# then store the ratio (within-swath weight) / (buffer weight) as a 
+# capture_fraction per cell. In the branching process, offspring are thinned 
+# by this fraction before being assigned to swath cells.
+# 200km is >20 decay lengths at beta=0.1/km, capturing >99.9999% of the 
+# true weight. At this point exp(-beta*d) = exp(-20) ≈ 2e-9.
+capture_buffer_km <- 200
+
 # Random seed for reproducibility
 set.seed(42)
 
@@ -940,6 +953,33 @@ cat(sprintf("  beta   = %.3f  (decay rate, decay length = %.0f km)\n",
             beta_gravity, 1/beta_gravity))
 cat(sprintf("  w_self = %.0f  (self-transmission weight)\n\n", w_self_gravity))
 
+# --- Pre-compute national land cell reference for capture fractions ----------
+# We need the total gravity weight from each swath cell to ALL national land 
+# cells (within the buffer radius) to compute what fraction of the "true" 
+# kernel weight is captured by the swath. This corrects for the fact that 
+# swath normalisation artificially recycles weight that would have gone to 
+# cells outside the swath.
+#
+# Strategy: build vectors of (lon, lat, pop_total) for all national land cells.
+# For each swath cell j, compute distances to national cells within the buffer,
+# sum their gravity weights, and compare to the within-swath row sum.
+#
+# Uganda has ~500 land cells at 10km resolution, so even computing distances 
+# to all of them (rather than filtering by buffer) is trivially fast.
+
+national_land_idx <- which(all_land & !is.na(all_land))
+national_lons     <- all_lons[national_land_idx]
+national_lats     <- all_lats[national_land_idx]
+national_pop      <- all_pop[national_land_idx] * cell_area_km2  # total persons per cell
+# Replace NAs with 0 (shouldn't happen after masking, but defensive)
+national_pop[is.na(national_pop)] <- 0
+n_national <- length(national_land_idx)
+
+cat(sprintf("National reference grid for capture fractions:\n"))
+cat(sprintf("  Land cells:      %d\n", n_national))
+cat(sprintf("  Buffer radius:   %d km\n", capture_buffer_km))
+cat(sprintf("  Total pop:       %.1f M\n\n", sum(national_pop) / 1e6))
+
 # For each valid swath, compute the gravity weight matrix W[j, l] and 
 # the normalised kernel P[j, l] = W[j, l] / sum_l(W[j, l]).
 # We store P as a matrix since it's reused every generation of the 
@@ -984,8 +1024,57 @@ for (i in seq_along(swath_list)) {
   row_sums <- rowSums(W)
   P <- W / row_sums
   
-  # Store the kernel matrix back in the swath
-  swath_list[[i]]$kernel_matrix <- P
+  # --- Compute capture fraction for each cell in the swath ---
+  # For each swath cell j, capture_fraction(j) = W_swath(j) / W_buffer(j)
+  # where:
+  #   W_swath(j)  = sum of gravity weights to cells IN the swath (= row_sums[j])
+  #   W_buffer(j) = sum of gravity weights to ALL national land cells within 
+  #                 capture_buffer_km of cell j
+  #
+  # The capture fraction tells us what proportion of offspring from cell j 
+  # would land within the swath vs. being "lost" to cells outside it.
+  # In the branching process, we thin offspring by this fraction.
+  
+  capture_frac <- numeric(n)
+  
+  for (j in 1:n) {
+    # Distance from swath cell j to all national land cells
+    d_to_national <- dist_km(sw$cell_lats[j], sw$cell_lons[j],
+                             national_lats, national_lons)
+    
+    # Filter to cells within the buffer radius
+    in_buffer <- d_to_national <= capture_buffer_km
+    
+    # Gravity weights to all buffer cells (using same formula as kernel)
+    # w = N_ℓ^alpha * exp(-beta * d)
+    w_buffer <- (national_pop[in_buffer])^alpha_gravity * 
+      exp(-beta_gravity * d_to_national[in_buffer])
+    
+    # Add w_self for the cell itself (which is one of the national cells)
+    # Find which national cell is closest to swath cell j (i.e., is cell j)
+    self_idx <- which.min(d_to_national)
+    if (d_to_national[self_idx] < cell_res_km * 0.5) {
+      # This national cell IS swath cell j — add w_self to its weight
+      # (it's already in w_buffer via the loop, but with w = N_j^alpha * exp(0) 
+      #  = N_j^alpha; we need to add w_self)
+      # Find its position within the in_buffer subset
+      buffer_indices <- which(in_buffer)
+      self_in_buffer <- which(buffer_indices == self_idx)
+      if (length(self_in_buffer) == 1) {
+        w_buffer[self_in_buffer] <- w_buffer[self_in_buffer] + w_self_gravity
+      }
+    }
+    
+    W_buffer_j <- sum(w_buffer)
+    W_swath_j  <- row_sums[j]
+    
+    # Capture fraction (clamp to [0, 1] for safety)
+    capture_frac[j] <- min(1.0, max(0.0, W_swath_j / W_buffer_j))
+  }
+  
+  # Store the kernel matrix and capture fractions back in the swath
+  swath_list[[i]]$kernel_matrix   <- P
+  swath_list[[i]]$capture_fraction <- capture_frac
   
   if (i %% 100 == 0) {
     cat(sprintf("  Computed kernel for swath %d / %d (%d cells)\n", 
@@ -994,6 +1083,38 @@ for (i in seq_along(swath_list)) {
 }
 
 cat("Done computing gravity kernels.\n\n")
+
+# --- Report capture fraction statistics --------------------------------------
+capture_fracs_all <- unlist(lapply(swath_list, function(s) {
+  if (!s$at_hub && !is.null(s$capture_fraction)) s$capture_fraction else NULL
+}))
+
+if (length(capture_fracs_all) > 0) {
+  cat("Capture fraction statistics (across all swath cells):\n")
+  cat(sprintf("  Median:  %.3f  (%.1f%% of offspring stay in swath)\n", 
+              median(capture_fracs_all), median(capture_fracs_all) * 100))
+  cat(sprintf("  Min:     %.3f  (worst-case cell: %.1f%% leaked)\n",
+              min(capture_fracs_all), (1 - min(capture_fracs_all)) * 100))
+  cat(sprintf("  Max:     %.3f\n", max(capture_fracs_all)))
+  cf_qs <- quantile(capture_fracs_all, probs = c(0.05, 0.25, 0.50, 0.75, 0.95))
+  cat("  Quantiles: ")
+  cat(paste(sprintf("%.3f", cf_qs), collapse = "  "))
+  cat("\n")
+  cat(sprintf("  Cells with capture < 0.50: %d / %d (%.1f%%)\n",
+              sum(capture_fracs_all < 0.50), length(capture_fracs_all),
+              100 * mean(capture_fracs_all < 0.50)))
+  cat(sprintf("  Cells with capture < 0.80: %d / %d (%.1f%%)\n",
+              sum(capture_fracs_all < 0.80), length(capture_fracs_all),
+              100 * mean(capture_fracs_all < 0.80)))
+  cat("\n")
+  
+  # Per-swath median capture fraction
+  swath_median_cf <- sapply(Filter(function(s) !s$at_hub && !is.null(s$capture_fraction), 
+                                   swath_list), 
+                            function(s) median(s$capture_fraction))
+  cat(sprintf("  Per-swath median capture: median = %.3f, range = [%.3f, %.3f]\n\n",
+              median(swath_median_cf), min(swath_median_cf), max(swath_median_cf)))
+}
 
 ## Plotting to visualise and check the outputs given this kernel formulation
 # Distance range to examine (0 to 50 km)
@@ -1136,6 +1257,8 @@ saveRDS(
       hub_travel_time_threshold = hub_travel_time_threshold,
       n_spillover_samples     = n_spillover_samples,
       swath_half_width_km     = swath_half_width_km,
+      hub_expansion_radius_km = hub_expansion_radius_km,
+      capture_buffer_km       = capture_buffer_km,
       cell_area_km2           = cell_area_km2,
       cell_res_km             = cell_res_km,
       alpha_gravity           = alpha_gravity,
@@ -1153,7 +1276,7 @@ cat("Saved swath library to", file.path(out_dir, "swath_library.rds"), "\n\n")
 # =============================================================================
 cat("\n========== STEP 8: Generating plots ==========\n\n")
 
-png(file.path(out_dir, "raster_overview.png"), width = 1800, height = 1200, res = 150)
+# png(file.path(out_dir, "raster_overview.png"), width = 1800, height = 1200, res = 150)
 par(mfrow = c(2, 3), mar = c(3, 3, 3, 4))
 
 # 1. Population density (log scale)
