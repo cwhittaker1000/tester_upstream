@@ -24,6 +24,7 @@
 # 'terra' is the modern replacement for 'raster' package, used for all 
 # raster operations (reading, reprojecting, resampling, etc.)
 library(terra)
+library(ggplot2)
 
 # --- Configuration -----------------------------------------------------------
 
@@ -931,7 +932,7 @@ cat("\n\n========== STEP 6: Pre-computing gravity kernel weights ==========\n\n"
 # Parameters (with defaults — these will be varied/calibrated later):
 alpha_gravity  <- 1.0     # population attractiveness exponent
 beta_gravity   <- 0.1     # distance decay rate (per km). 1/beta = 10km decay length
-w_self_gravity <- 500     # extra weight for within-cell transmission
+w_self_gravity <- 100     # extra weight for within-cell transmission
 
 cat(sprintf("Gravity kernel parameters:\n"))
 cat(sprintf("  alpha  = %.2f  (population exponent)\n", alpha_gravity))
@@ -994,6 +995,120 @@ for (i in seq_along(swath_list)) {
 
 cat("Done computing gravity kernels.\n\n")
 
+## Plotting to visualise and check the outputs given this kernel formulation
+# Distance range to examine (0 to 50 km)
+distances <- seq(0, 50, by = 0.5)
+
+# Population scenarios to compare
+pop_scenarios <- c(500, 2000, 5000, 10000)  # people per cell
+
+# Create a data frame for plotting
+kernel_data <- data.frame()
+
+for (source_pop in pop_scenarios) {
+  for (target_pop in pop_scenarios) {
+    
+    # Within-cell transmission (d = 0)
+    w_self <- source_pop^alpha_gravity + w_self_gravity
+    
+    # Between-cell transmission for each distance
+    w_between <- target_pop^alpha_gravity * exp(-beta_gravity * distances[-1])  # exclude d=0
+    
+    # Combine for normalization (approximate - assumes only these two cells exist)
+    total_weight <- w_self + sum(w_between)
+    
+    # Transmission probabilities
+    p_self <- w_self / total_weight
+    p_between <- w_between / total_weight
+    
+    # Store results
+    kernel_data <- rbind(kernel_data, data.frame(
+      source_pop = source_pop,
+      target_pop = target_pop,
+      distance = 0,
+      prob = p_self,
+      type = "within-cell"
+    ))
+    
+    kernel_data <- rbind(kernel_data, data.frame(
+      source_pop = source_pop,
+      target_pop = target_pop, 
+      distance = distances[-1],
+      prob = p_between,
+      type = "between-cell"
+    ))
+  }
+}
+
+# Plot 1: Distance decay for different target populations (fixed source = 2000)
+p1 <- ggplot(subset(kernel_data, source_pop == 2000 & type == "between-cell"), 
+             aes(x = distance, y = prob, color = factor(target_pop))) +
+  geom_line(size = 1) +
+  # scale_y_log10() +
+  labs(title = "Transmission Probability vs Distance\n(Source cell: 2000 people)",
+       x = "Distance (km)", 
+       y = "Transmission probability (log scale)",
+       color = "Target\npopulation") +
+  theme_minimal()
+
+print(p1)
+
+# Plot 2: Within-cell dominance across population sizes
+within_cell_data <- subset(kernel_data, type == "within-cell" & target_pop == source_pop)
+p2 <- ggplot(within_cell_data, aes(x = source_pop, y = prob)) +
+  geom_line(size = 1, color = "red") +
+  geom_point(size = 3, color = "red") +
+  labs(title = "Within-Cell Transmission Probability\n(Effect of w_self = 500)",
+       x = "Cell population", 
+       y = "Probability of within-cell transmission") +
+  theme_minimal()
+
+print(p2)
+
+# Plot 3: 2D visualization around a source cell
+create_2d_kernel <- function(source_pop = 2000, grid_size = 21, cell_size_km = 5) {
+  
+  # Create a grid centered on the source
+  center <- (grid_size + 1) / 2
+  grid <- expand.grid(x = 1:grid_size, y = 1:grid_size)
+  
+  # Calculate distances from center
+  grid$dist_km <- sqrt((grid$x - center)^2 + (grid$y - center)^2) * cell_size_km
+  
+  # Assume uniform target population
+  target_pop <- 2000
+  
+  # Calculate weights
+  grid$weight <- ifelse(grid$dist_km == 0, 
+                        source_pop^alpha_gravity + w_self_gravity,  # within-cell
+                        target_pop^alpha_gravity * exp(-beta_gravity * grid$dist_km))  # between-cell
+  
+  # Normalize to probabilities  
+  grid$prob <- grid$weight / sum(grid$weight)
+  
+  return(grid)
+}
+
+grid_2d <- create_2d_kernel()
+
+p3 <- ggplot(grid_2d, aes(x = x, y = y, fill = prob)) +
+  geom_tile() +
+  scale_fill_viridis_c(trans = "log10", name = "Transmission\nprobability") +
+  geom_point(x = (21+1)/2, y = (21+1)/2, color = "red", size = 4, shape = 8) +  # source
+  labs(title = "2D Gravity Kernel\n(Red star = source cell, 5km resolution)",
+       x = "Grid X", y = "Grid Y") +
+  theme_minimal() +
+  coord_equal()
+
+print(p3)
+
+# Summary statistics
+cat("\nGravity kernel summary:\n")
+cat(sprintf("Distance decay length (1/beta): %.1f km\n", 1/beta_gravity))
+cat(sprintf("w_self effect in small cell (1000 people): %.0f%% within-cell\n", 
+            100 * (1000 + w_self_gravity) / (1000 + w_self_gravity + 1000)))
+cat(sprintf("w_self effect in large cell (10000 people): %.0f%% within-cell\n", 
+            100 * (10000 + w_self_gravity) / (10000 + w_self_gravity + 10000)))
 
 # =============================================================================
 # STEP 7: Save everything
@@ -1021,7 +1136,6 @@ saveRDS(
       hub_travel_time_threshold = hub_travel_time_threshold,
       n_spillover_samples     = n_spillover_samples,
       swath_half_width_km     = swath_half_width_km,
-      hub_radius_km           = hub_radius_km,
       cell_area_km2           = cell_area_km2,
       cell_res_km             = cell_res_km,
       alpha_gravity           = alpha_gravity,
