@@ -19,7 +19,6 @@
 #
 # Dependencies: none (base R only)
 # =============================================================================
-
 source("functions/branching_process.R")
 
 # =============================================================================
@@ -44,8 +43,7 @@ chains <- replicate(1000, {
                              R0 = 0.5, k = 1.0)
   r$chain_size
 })
-cat(sprintf("  Mean chain size: %.2f (theory ≈ %.2f)\n",
-            mean(chains), 1 / (1 - 0.5)))
+cat(sprintf("  Mean chain size: %.2f (theory ≈ %.2f)\n", mean(chains), 1 / (1 - 0.5)))
 cat(sprintf("  Max chain size:  %d\n\n", max(chains)))
 
 # --- Test 2: Single cell, supercritical at hub (Stage 3c) ------------------
@@ -64,7 +62,6 @@ p_extinct <- mean(outcomes == "extinct")
 p_hub     <- mean(outcomes == "hub_established")
 cat(sprintf("  P(extinct) = %.3f (theory ≈ 0.667)\n", p_extinct))
 cat(sprintf("  P(hub_est) = %.3f (theory ≈ 0.333)\n", p_hub))
-cat("  PASSED\n\n")
 
 # --- Test 3: Multi-cell spatial swath (Stage 3b) ---------------------------
 cat("--- Test 3: Spatial branching (5-cell corridor, R₀ = 1.5) ---\n")
@@ -89,10 +86,11 @@ K_test <- W_test / rowSums(W_test)
 # Capture fractions: assume full capture for this simple test
 cf_test <- rep(1.0, n_test)
 
-# Run one event with logging
+# Run one event with BOTH gen_log and cell_log
 res_spatial <- run_branching_process(
   N_pop = pops_test, hub_mask = hub_test, kernel = K_test, spill_idx = 1L,
-  R0 = 1.5, k = 1.0, N_crit = 100, capture_frac = cf_test, log_gens = TRUE
+  R0 = 1.5, k = 1.0, N_crit = 100, capture_frac = cf_test, 
+  log_gens = TRUE, log_cells = TRUE
 )
 
 cat(sprintf("  Outcome: %s | Chain: %d | Hub inf: %d | Gens: %d\n",
@@ -100,7 +98,11 @@ cat(sprintf("  Outcome: %s | Chain: %d | Hub inf: %d | Gens: %d\n",
             res_spatial$hub_infections, res_spatial$generations))
 cat("  Generation log:\n")
 print(res_spatial$gen_log)
-cat("\n")
+cat("\n  Per-cell infection log (new infections per cell per generation):\n")
+cat("  Columns: [spill] [rural] [rural] [rural] [HUB]\n")
+print(res_spatial$cell_log)
+cat("\n  Note: infections can flow backwards (cell 2 → cell 1, etc.)\n")
+cat("  This is correct: the gravity kernel is isotropic (distance-based).\n\n")
 
 # Run 500 spatial events to get outcome distribution
 cat("  Running 500 spatial events...\n")
@@ -118,9 +120,7 @@ chain_vec   <- as.integer(spatial_outcomes["chain", ])
 cat(sprintf("  P(extinct):         %.3f\n", mean(outcome_vec == "extinct")))
 cat(sprintf("  P(hub_established): %.3f\n", mean(outcome_vec == "hub_established")))
 cat(sprintf("  P(generation_cap):  %.3f\n", mean(outcome_vec == "generation_cap")))
-cat(sprintf("  Mean chain (extinct only): %.1f\n",
-            mean(chain_vec[outcome_vec == "extinct"])))
-cat("  PASSED\n\n")
+cat(sprintf("  Mean chain (extinct only): %.1f\n", mean(chain_vec[outcome_vec == "extinct"])))
 
 # --- Test 4: simulate_event() dispatcher -----------------------------------
 cat("--- Test 4: simulate_event() dispatcher ---\n")
@@ -164,6 +164,9 @@ r3 <- simulate_event(event_nh, mock_swath_hub, mock_hub_info)
 cat(sprintf("  Nonspatial hub: outcome=%s, chain=%d, hub_inf=%d\n",
             r3$outcome, r3$chain_size, r3$hub_infections))
 
-r4 <- simulate_event(event_sp, mock_swath_spatial, mock_hub_info)
+r4 <- simulate_event(event_sp, mock_swath_spatial, mock_hub_info,
+                     log_gens = TRUE, log_cells = TRUE)
 cat(sprintf("  Spatial:        outcome=%s, chain=%d, hub_inf=%d\n",
             r4$outcome, r4$chain_size, r4$hub_infections))
+
+cat("  PASSED\n\n")

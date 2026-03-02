@@ -33,6 +33,9 @@
 #                     thinning is applied (appropriate for 1-cell swaths).
 # @param log_gens     Logical: if TRUE, record per-generation diagnostics.
 #                     Default FALSE for speed in production runs.
+# @param log_cells    Logical: if TRUE, record infections per cell per 
+#                     generation as a matrix. Useful for visualising wavefront
+#                     propagation through the corridor. Default FALSE.
 # @param offspring_cap Integer: maximum total offspring per cell per generation.
 #                     Safety valve against extreme NegBin draws. Default 10000.
 #
@@ -43,6 +46,8 @@
 #   $generations     Integer: number of generations elapsed
 #   $peak_infected   Integer: maximum simultaneously infected across any generation
 #   $gen_log         Data frame (only if log_gens = TRUE): per-generation stats
+#   $cell_log        Matrix (only if log_cells = TRUE): rows = generations,
+#                    cols = cells. Entry [g, j] = new infections in cell j at gen g.
 # =============================================================================
 
 run_branching_process <- function(N_pop,
@@ -55,6 +60,7 @@ run_branching_process <- function(N_pop,
                                   g_max        = 100,
                                   capture_frac = NULL,
                                   log_gens     = FALSE,
+                                  log_cells    = FALSE,
                                   offspring_cap = 10000) {
   
   n_cells <- length(N_pop)
@@ -97,6 +103,14 @@ run_branching_process <- function(N_pop,
       cum_total      = C_total,
       cum_hub        = C_hub
     )
+  }
+  
+  # --- Optional per-cell log -------------------------------------------------
+  # Matrix where row g = generation, col j = cell. Stores new infections.
+  # Pre-allocate with g_max+1 rows; we trim at the end.
+  if (log_cells) {
+    cell_log <- matrix(0L, nrow = g_max + 1, ncol = n_cells)
+    cell_log[1, spill_idx] <- 1L  # generation 0: initial case
   }
   
   # --- Generation loop -------------------------------------------------------
@@ -185,6 +199,11 @@ run_branching_process <- function(N_pop,
     total_active <- sum(I)
     peak_infected <- max(peak_infected, total_active)
     
+    # --- Log per-cell infections this generation -----------------------------
+    if (log_cells) {
+      cell_log[g + 1, ] <- I_next  # row g+1 because row 1 = generation 0
+    }
+    
     # --- Log this generation -------------------------------------------------
     if (log_gens) {
       gen_log <- rbind(gen_log, data.frame(
@@ -236,8 +255,15 @@ run_branching_process <- function(N_pop,
     result$gen_log <- gen_log
   }
   
+  if (log_cells) {
+    # Trim to actual generations elapsed (g+1 rows: gen 0 through gen g)
+    result$cell_log <- cell_log[1:(g + 1), , drop = FALSE]
+    rownames(result$cell_log) <- paste0("g", 0:g)
+  }
+  
   return(result)
 }
+
 
 # =============================================================================
 # make_nonspatial_swath()
@@ -307,6 +333,7 @@ simulate_event <- function(event,
                            N_crit          = 500,
                            g_max           = 100,
                            log_gens        = FALSE,
+                           log_cells       = FALSE,
                            nonspatial_pop  = 10000) {
   
   route <- event$route
@@ -332,6 +359,10 @@ simulate_event <- function(event,
         hub_infections = 0L, active_cells = 1L, cum_total = 1L, cum_hub = 0L
       )
     }
+    if (log_cells) {
+      result$cell_log <- matrix(1L, nrow = 1, ncol = 1,
+                                dimnames = list("g0", "cell1"))
+    }
     return(result)
   }
   
@@ -349,7 +380,8 @@ simulate_event <- function(event,
       N_crit       = N_crit,
       g_max        = g_max,
       capture_frac = ns$capture_frac,
-      log_gens     = log_gens
+      log_gens     = log_gens,
+      log_cells    = log_cells
     )
   }
   
@@ -367,7 +399,8 @@ simulate_event <- function(event,
       N_crit       = N_crit,
       g_max        = g_max,
       capture_frac = swath$capture_fraction,
-      log_gens     = log_gens
+      log_gens     = log_gens,
+      log_cells    = log_cells
     )
   }
   
@@ -401,7 +434,8 @@ simulate_event <- function(event,
       N_crit       = N_crit,
       g_max        = g_max,
       capture_frac = ns$capture_frac,
-      log_gens     = log_gens
+      log_gens     = log_gens,
+      log_cells    = log_cells
     )
   }
   
@@ -420,6 +454,10 @@ simulate_event <- function(event,
   
   if (log_gens && !is.null(bp_result$gen_log)) {
     result$gen_log <- bp_result$gen_log
+  }
+  
+  if (log_cells && !is.null(bp_result$cell_log)) {
+    result$cell_log <- bp_result$cell_log
   }
   
   return(result)
